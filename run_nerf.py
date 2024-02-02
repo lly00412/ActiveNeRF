@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm, trange
+from einops import rearrange
 
 import matplotlib.pyplot as plt
 
@@ -16,6 +17,14 @@ from run_nerf_helpers import *
 from load_llff import load_llff_data
 from load_blender import load_blender_data
 import warnings
+
+# metrics
+from torchmetrics import (
+    StructuralSimilarityIndexMeasure
+)
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
+
+
 warnings.filterwarnings('ignore')
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -466,6 +475,8 @@ def config_parser():
                         help='where to store ckpts and logs')
     parser.add_argument("--datadir", type=str, default='./data/fern', 
                         help='input data directory')
+    parser.add_argument("--jsondir", type=str, default='./data/fern',
+                        help='input json directory')
 
     # training options
     parser.add_argument("--netdepth", type=int, default=8, 
@@ -566,6 +577,7 @@ def config_parser():
     parser.add_argument("--beta_min",   type=float, default=0.01) # Minimun value for uncertainty
     parser.add_argument("--w",   type=float, default=0.01) # Strength for regularization as in Eq.(11)
     parser.add_argument("--ds_rate",   type=int, default=2) # Quality-efficiency trade-off factor as in Sec. 5.2
+    parser.add_argument('--init_train', type=int, nargs='+', default=[57,27,32,63,92,19,85,40,20,69,30,28,58,13]) # init train set ids
 
     return parser
 
@@ -606,7 +618,7 @@ def train():
         print('NEAR FAR', near, far)
 
     elif args.dataset_type == 'blender':
-        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.half_res, args.testskip)
+        images, poses, render_poses, hwf, i_split = load_blender_data(args.datadir, args.jsondir, args.half_res, args.testskip)
         print('Loaded blender', images.shape, render_poses.shape, hwf, args.datadir)
         i_train, i_holdout, i_val, i_test = i_split
 
@@ -651,6 +663,13 @@ def train():
     if i_train_load is not None:
         i_train = i_train_load
         i_holdout = i_holdout_load
+
+    # change train holdout to be manually set
+    # TODO: change i_train start from a manually selection
+    if args.init_train is not None:
+        all_imgs = np.concatenate((i_train,i_holdout))
+        i_train = np.array(args.init_train)
+        i_holdout = np.setdiff1d(all_imgs,i_train)
 
     bds_dict = {
         'near' : near,
@@ -716,12 +735,32 @@ def train():
     print('HOLDOUT views are', i_holdout)
     print('TEST views are', i_test)
     print('VAL views are', i_val)
+
+    f = os.path.join(basedir, expname, 'vs_log.txt')
+    with open(f, 'a') as file:
+        file.write(f'Train views: {i_train}\n')
+        file.write(f'Holdout views: {i_holdout}\n')
+        file.close()
+
+    val_ssim = StructuralSimilarityIndexMeasure(data_range=1)
+    val_lpips = LearnedPerceptualImagePatchSimilarity('vgg')
+    for p in val_lpips.net.parameters():
+        p.requires_grad = False
     
     start = start + 1
+
+    start_time = time.time()
+
+    eval_iter = [x-1 for x in args.active_iter]
+    eval_iter = [10, N_iters-1]+eval_iter
+
     for i in trange(start, N_iters):
 
         # active evaluation
         if i in args.active_iter:
+
+            vs_start = time.time()
+
             print('start evaluation:')
             print('get rays')
             rays = np.stack([get_rays_np(H, W, focal, p) for p in poses.cpu().numpy()[:,:3,:4]], 0) # [N, ro+rd, H, W, 3]
@@ -750,10 +789,31 @@ def train():
             print('shuffle rays')
             np.random.shuffle(rays_rgb_train)
 
-            f = os.path.join(basedir, expname, 'args.txt')
+            vs_end = time.time()
+            # vs_time = vs_end-vs_start
+            time_cost = time.strftime("%H:%M:%S", time.gmtime(vs_end - vs_start))
+            f = os.path.join(basedir, expname, 'vs_log.txt')
             with open(f, 'a') as file:
-                file.write(str(i_train))
-                file.write(str(i_holdout))
+                file.write(f'VS iter: {i}\n')
+                file.write(f'Train views: {i_train}\n')
+                file.write(f'Selected views: {hold_out_index}\n')
+                file.write(f'Holdout views: {i_holdout}\n')
+                file.write(f'Time for selection process: {time_cost}\n')
+                file.close()
+
+            # f = os.path.join(basedir, expname, 'args.txt')
+            # with open(f, 'a') as file:
+            #     file.write(str(i_train))
+            #     file.write(str(i_holdout))
+
+            # TODO: add view selection time and view selection number
+            # with open(self.vs_log, 'a') as f:
+            #     f.write(f'VS Round {self.current_vs}\n')
+            #     f.write(f'View Select by: {self.hparams.vs_by}\n')
+            #     f.write(f'Sample rate: {self.hparams.vs_sample_rate}')
+            #     f.write(f'Selected views: {vs_choice}\n')
+            #     f.write(f'Time for selection process: {time_cost}\n')
+            #     f.close()
 
         time0 = time.time()
 
@@ -782,6 +842,26 @@ def train():
 
         loss = img_loss
         psnr = mse2psnr(img2mse(rgb, target_s))
+
+        # if i in eval_iter:
+        #     torch.cuda.empty_cache()
+        #     val_ssim(rgb, target_s)
+        #     ssim = val_ssim.compute()
+        #     val_ssim.reset()
+        #
+        #     val_lpips(torch.clip(rgb[:, :, :, :] * 2 - 1, -1, 1),
+        #     torch.clip(target_s[:, :, :, :] * 2 - 1, -1, 1))
+        #     lpips = val_lpips.compute()
+        #     val_lpips.reset()
+        #     lpips = lpips.mean()
+        #
+        #     f = os.path.join(basedir, expname, 'vs_log.txt')
+        #     with open(f, 'a') as file:
+        #         file.write(f'psnr: {psnr}\n')
+        #         file.write(f'ssim: {ssim}\n')
+        #         file.write(f'lpips: {lpips}\n')
+        #         file.close()
+
 
         if 'rgb0' in extras:
             img_loss0 = img2mse(extras['rgb0'], target_s)
@@ -835,6 +915,55 @@ def train():
             with torch.no_grad():
                 render_path(torch.Tensor(poses[i_test]).to(device), hwf, args.chunk, render_kwargs_test, gt_imgs=images[i_test], savedir=testsavedir)
             print('Saved test set')
+
+        if i in eval_iter:
+            print('Eval in test set!')
+            psnr_test = []
+            ssim_test = []
+            lpips_test = []
+            pbar = tqdm(total=len(i_test))
+            for img_i in i_test:
+                torch.cuda.empty_cache()
+                pose = poses[img_i, :3, :4]
+                with torch.no_grad():
+                    rgb, disp, acc, uncert, alpha, extras = render(H, W, focal, chunk=args.chunk, c2w=pose,
+                                                    **render_kwargs_test)
+                target = images[img_i].to(rgb)
+                psnr = mse2psnr(img2mse(rgb, target))
+                psnr_test.append(psnr)
+
+                rgb = rearrange(rgb, 'h w c -> 1 c h w', h=H)
+                target = rearrange(target, 'h w c -> 1 c h w', h=H)
+
+                val_ssim(rgb, target)
+                ssim = val_ssim.compute()
+                ssim_test.append(ssim)
+                val_ssim.reset()
+
+                val_lpips(torch.clip(rgb[:, :, :, :] * 2 - 1, -1, 1),
+                torch.clip(target[:, :, :, :] * 2 - 1, -1, 1))
+                lpips = val_lpips.compute()
+                lpips = lpips.mean()
+                lpips_test.append(lpips)
+                val_lpips.reset()
+
+                print(f'img_id:{img_i}\t psnr:{psnr}\t ssim:{ssim}\t lpips:{lpips}\n')
+
+                pbar.update(1)
+
+            psnr_all = torch.Tensor(psnr_test).mean()
+            ssim_all = torch.Tensor(ssim_test).mean()
+            lpips_all = torch.Tensor(lpips_test).mean()
+            pbar.close()
+
+            f = os.path.join(basedir, expname, 'vs_log.txt')
+            with open(f, 'a') as file:
+                file.write(f'psnr: {psnr_all}\n')
+                file.write(f'ssim: {ssim_all}\n')
+                file.write(f'lpips: {lpips_all}\n')
+                file.close()
+            print(f'Total Test: psnr:{psnr_all}\t ssim:{ssim_all}\t lpips:{lpips_all}\n')
+
     
         if i%args.i_print==0:
             tqdm.write(f"[TRAIN] Iter: {i} Loss: {loss.item()}  PSNR: {psnr.item()}")
@@ -881,6 +1010,16 @@ def train():
         """
 
         global_step += 1
+
+    end_time = time.time()
+
+    runtime = time.strftime("%H:%M:%S", time.gmtime(end_time - start_time))
+    print('Total runtime: {}'.format(runtime))
+    f = os.path.join(basedir, expname, 'vs_log.txt')
+    with open(f, 'a') as file:
+        file.write(f'Total runtime: {runtime}\n')
+        file.close()
+
 
 if __name__=='__main__':
     torch.set_default_tensor_type('torch.cuda.FloatTensor')
